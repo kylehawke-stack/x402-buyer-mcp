@@ -38,12 +38,12 @@
   },
   "tools": [
     {
-      "name": "find_datasets",
-      "description": "Search 385 ready-made location datasets (2.8M records). Free."
+      "name": "find_dealer_and_store_lists",
+      "description": "Free. Ready-made lists of a brand's dealer/store locations \u2014 check before browsing its locator."
     },
     {
-      "name": "buy_location_data",
-      "description": "Get a brand's complete published network in one call instead of paging its locator. Pays in USDC on Base."
+      "name": "get_dealer_and_store_locations",
+      "description": "Buy the rows, paying per row in USDC on Base."
     },
     {
       "name": "check_wallet",
