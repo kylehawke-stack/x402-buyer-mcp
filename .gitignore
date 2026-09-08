@@ -1,0 +1,4 @@
+node_modules/
+*.mcpb
+run.sh
+.env

@@ -1,0 +1,81 @@
+{
+  "manifest_version": "0.2",
+  "name": "locationlists-buyer",
+  "display_name": "LocationLists \u2014 Agent Wallet",
+  "version": "1.0.0",
+  "description": "Lets Claude buy business location data on its own, paying in USDC on Base. No card, no account, no checkout page.",
+  "long_description": "Claude cannot sign an on-chain payment \u2014 it holds no keys, and it never will. This extension gives it a wallet to call.\n\nWhen Claude needs location data it does not have, it calls a tool here. The tool asks locationlists.com for the data, receives an HTTP 402 with a price, signs a USDC payment on Base, and returns the records. Claude decides what to buy; this extension holds the money.\n\nYou must fund the wallet yourself with USDC on Base. Spending limits are enforced before anything is signed: a per-call cap and a per-session cap, both of which you set below. An LLM with a wallet will eventually call a paid tool in a loop, so these are not optional.",
+  "author": {
+    "name": "LocationLists",
+    "url": "https://locationlists.com"
+  },
+  "homepage": "https://locationlists.com/agents",
+  "documentation": "https://github.com/kylehawke-stack/x402-buyer-mcp#readme",
+  "support": "https://github.com/kylehawke-stack/x402-buyer-mcp/issues",
+  "license": "MIT",
+  "keywords": [
+    "x402",
+    "usdc",
+    "base",
+    "agent payments",
+    "location data",
+    "mcp"
+  ],
+  "server": {
+    "type": "node",
+    "entry_point": "server.mjs",
+    "mcp_config": {
+      "command": "node",
+      "args": [
+        "${__dirname}/server.mjs"
+      ],
+      "env": {
+        "X402_BUYER_KEY": "${user_config.wallet_key}",
+        "MAX_SPEND_PER_CALL_USD": "${user_config.max_per_call}",
+        "MAX_SPEND_TOTAL_USD": "${user_config.max_per_session}"
+      }
+    }
+  },
+  "tools": [
+    {
+      "name": "find_datasets",
+      "description": "Search 385 ready-made location datasets (2.8M records). Free."
+    },
+    {
+      "name": "buy_location_data",
+      "description": "Get a brand's complete published network in one call instead of paging its locator. Pays in USDC on Base."
+    },
+    {
+      "name": "check_wallet",
+      "description": "Balance, session spend and limits. Free."
+    }
+  ],
+  "user_config": {
+    "wallet_key": {
+      "type": "string",
+      "title": "Wallet private key",
+      "description": "Private key of a wallet holding USDC on Base. Use a DEDICATED wallet funded with only what you are willing to let an AI spend \u2014 never your main one.",
+      "sensitive": true,
+      "required": true
+    },
+    "max_per_call": {
+      "type": "string",
+      "title": "Maximum per purchase (USD)",
+      "description": "Any single purchase above this is refused before it is signed.",
+      "default": "1.00",
+      "required": false
+    },
+    "max_per_session": {
+      "type": "string",
+      "title": "Maximum per session (USD)",
+      "description": "Total spend allowed before the extension stops buying. Resets when Claude restarts.",
+      "default": "5.00",
+      "required": false
+    }
+  },
+  "compatibility": {
+    "runtimes": {
+      "node": ">=20.0.0"
+    }
+  }
+}

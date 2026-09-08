@@ -1,0 +1,14 @@
+{
+  "name": "locationlists-buyer",
+  "version": "1.0.0",
+  "description": "Give Claude a wallet: buy business location data autonomously with x402 over USDC on Base.",
+  "main": "server.mjs",
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "viem": "^2.56.3"
+  },
+  "type": "module"
+}
