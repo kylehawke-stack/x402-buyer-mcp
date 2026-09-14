@@ -95,7 +95,9 @@ async function sellerCall(name, args, { payment, transport = "mcp" } = {}) {
     headers: {
       "Content-Type": "application/json",
       Accept: "application/json, text/event-stream",
-      ...(http ? { "X-402-Transport": "http" } : {}),
+      // Sellers treat a request without MCP-Protocol-Version as a raw (legacy)
+      // caller and answer HTTP 402; send it so the MCP transport path is used.
+      ...(http ? { "X-402-Transport": "http" } : { "MCP-Protocol-Version": "2025-06-18" }),
       ...(http && payment ? { "PAYMENT-SIGNATURE": b64(payment), "X-PAYMENT": b64(payment) } : {}),
     },
     body: JSON.stringify({
