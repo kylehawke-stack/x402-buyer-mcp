@@ -17,9 +17,13 @@ Filters reach every column a list carries — revenue, employees, category, deal
 not just geography, and the filter arguments are read from locationlists.com at startup,
 so new ones arrive without reinstalling.
 
-The extension asks locationlists.com for the records, gets back **HTTP 402** with a
-price, signs a **USDC payment on Base**, retries with the payment attached, and hands
-Claude the rows. The whole thing takes a few seconds and settles on a public
+The extension asks locationlists.com for the records, gets back an **x402 payment
+demand** with a price, signs a **USDC payment on Base**, retries with the payment
+attached, and hands Claude the rows. By default this speaks the x402 MCP transport
+(the demand is a tool result, the payment rides in `_meta["x402/payment"]`); a seller
+that answers with HTTP 402 is paid through headers instead, and `via: "http"` buys
+through the plain HTTP endpoint `POST /api/x402/query`. Same rows, same price, same
+limits. The whole thing takes a few seconds and settles on a public
 blockchain you can check afterwards.
 
 Pricing is per row, derived from each dataset — a slice of a large file costs cents.
@@ -88,6 +92,7 @@ the server reads:
 | `MAX_SPEND_PER_CALL_USD` | `1.00` | refuse any single purchase above this |
 | `MAX_SPEND_TOTAL_USD` | `5.00` | refuse once the session total would exceed this |
 | `X402_SELLER_MCP` | `https://locationlists.com/mcp` | the x402 seller to buy from |
+| `X402_SELLER_HTTP` | `<seller origin>/api/x402/query` | plain-HTTP x402 endpoint used by `via: "http"` |
 | `X402_RPC_URL` | `https://mainnet.base.org` | Base RPC for balance reads |
 
 ## Run from source

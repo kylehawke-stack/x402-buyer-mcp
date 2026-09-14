@@ -1,6 +1,6 @@
 {
   "name": "locationlists-buyer",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "Give Claude a wallet: buy business location data autonomously with x402 over USDC on Base.",
   "main": "server.mjs",
   "keywords": [],

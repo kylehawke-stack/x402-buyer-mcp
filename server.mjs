@@ -7,9 +7,19 @@
  * this server signs and pays for it. That is not a workaround, it is the shape
  * agent payments actually take: the model reasons, a tool holds the money.
  *
- * What it does: calls a paid tool on an x402 server, gets HTTP 402 with terms,
+ * What it does: calls a paid tool on an x402 server, gets the payment terms,
  * signs an EIP-3009 transferWithAuthorization for the quoted USDC, retries with
  * the payment attached, and hands back the data. No card, no account, no human.
+ *
+ * Two x402 transports, same money:
+ *   mcp  (default) — specs/transports-v2/mcp.md. The unpaid call returns a tool
+ *        result with isError and the PaymentRequired in structuredContent; the
+ *        payment goes back in params._meta["x402/payment"]; the receipt comes in
+ *        result._meta["x402/payment-response"]. If the seller instead answers
+ *        HTTP 402 (older sellers), this falls back to headers automatically.
+ *   http (via: "http") — plain POST to the seller's /api/x402/query: 402 with a
+ *        PAYMENT-REQUIRED header, pay with PAYMENT-SIGNATURE, receipt in
+ *        PAYMENT-RESPONSE.
  *
  * SPENDING LIMITS ARE NOT OPTIONAL. An LLM with a wallet will, sooner or later,
  * call the paid tool in a loop. MAX_SPEND_PER_CALL_USD and MAX_SPEND_TOTAL_USD
@@ -49,18 +59,91 @@ const ERC20_BALANCE = [
 
 let spentThisSession = 0
 
-/** One JSON-RPC call to the seller's MCP endpoint. */
-async function sellerCall(name, args, paymentHeader) {
+/** The seller's plain-HTTP x402 endpoint, next to its MCP endpoint unless overridden. */
+const SELLER_HTTP = process.env.X402_SELLER_HTTP || new URL("/api/x402/query", SELLER_MCP).href
+
+const b64 = (obj) => Buffer.from(JSON.stringify(obj)).toString("base64")
+function unb64(v) {
+  if (!v) return null
+  try {
+    return JSON.parse(Buffer.from(v, "base64").toString("utf8"))
+  } catch {
+    return null
+  }
+}
+
+async function readJson(res) {
+  const raw = await res.text()
+  try {
+    return JSON.parse(raw)
+  } catch {
+    return { error: raw.slice(0, 500) }
+  }
+}
+
+/**
+ * One JSON-RPC call to the seller's MCP endpoint.
+ *
+ * transport "mcp": payment (a PaymentPayload object) rides in params._meta["x402/payment"].
+ * transport "http": asks the seller for HTTP 402 (X-402-Transport: http) and sends
+ * the payment base64 in PAYMENT-SIGNATURE, plus X-PAYMENT for sellers that predate v2.
+ */
+async function sellerCall(name, args, { payment, transport = "mcp" } = {}) {
+  const http = transport === "http"
   const res = await fetch(SELLER_MCP, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Accept: "application/json, text/event-stream",
-      ...(paymentHeader ? { "X-PAYMENT": paymentHeader } : {}),
+      ...(http ? { "X-402-Transport": "http" } : {}),
+      ...(http && payment ? { "PAYMENT-SIGNATURE": b64(payment), "X-PAYMENT": b64(payment) } : {}),
     },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }),
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name, arguments: args, ...(!http && payment ? { _meta: { "x402/payment": payment } } : {}) },
+    }),
   })
-  return { status: res.status, body: await res.json() }
+  return { status: res.status, headers: res.headers, body: await readJson(res) }
+}
+
+/** POST to the seller's plain-HTTP x402 endpoint. */
+async function httpQuery(args, payment) {
+  const res = await fetch(SELLER_HTTP, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      ...(payment ? { "PAYMENT-SIGNATURE": b64(payment) } : {}),
+    },
+    body: JSON.stringify(args),
+  })
+  return { status: res.status, headers: res.headers, body: await readJson(res) }
+}
+
+/**
+ * The PaymentRequired in a seller response, whichever transport carried it, or
+ * null when the response is not a payment demand. Prefers structuredContent,
+ * then content[0].text (spec order), then an HTTP 402's PAYMENT-REQUIRED header,
+ * then its body.
+ */
+function paymentRequiredOf({ status, headers, body }) {
+  const isPR = (o) => !!o && typeof o === "object" && o.x402Version != null && Array.isArray(o.accepts) && o.accepts.length > 0
+  const r = body?.result
+  if (r?.isError) {
+    if (isPR(r.structuredContent)) return r.structuredContent
+    try {
+      const j = JSON.parse(r.content?.[0]?.text ?? "")
+      if (isPR(j)) return j
+    } catch {}
+  }
+  if (status === 402) {
+    const h = unb64(headers.get("payment-required"))
+    if (isPR(h)) return h
+    if (isPR(body)) return body
+  }
+  return null
 }
 
 /**
@@ -71,7 +154,7 @@ async function sellerCall(name, args, paymentHeader) {
  * "USDC", and signing over the wrong name produces a signature that recovers to
  * the wrong address — rejected only after the buyer thinks they have paid.
  */
-async function signPayment(terms) {
+async function signPayment(pr, terms) {
   const value = BigInt(terms.amount ?? terms.maxAmountRequired)
   const chainId = Number(String(terms.network).split(":")[1] ?? base.id)
   const validBefore = BigInt(Math.floor(Date.now() / 1000) + 3600)
@@ -93,11 +176,16 @@ async function signPayment(terms) {
     message: { from: account.address, to: terms.payTo, value, validAfter: 0n, validBefore, nonce },
   })
 
-  const payload = {
+  // The PaymentPayload, as an object. Echoes `resource` and `extensions` from the
+  // PaymentRequired as the spec asks: the Bazaar catalogs a seller only from a
+  // settled payload that carries its `bazaar` extension.
+  return {
     x402Version: 2,
     scheme: terms.scheme,
     network: terms.network,
+    ...(pr.resource ? { resource: pr.resource } : {}),
     accepted: terms,
+    ...(pr.extensions ? { extensions: pr.extensions } : {}),
     payload: {
       signature,
       authorization: {
@@ -110,7 +198,6 @@ async function signPayment(terms) {
       },
     },
   }
-  return Buffer.from(JSON.stringify(payload)).toString("base64")
 }
 
 async function usdcBalance(asset) {
@@ -154,6 +241,22 @@ async function sellerSchemas() {
   }
 }
 const SELLER = await sellerSchemas()
+
+/** The seller's query schema plus this extension's own `via` switch. */
+function withVia(schema) {
+  return {
+    ...schema,
+    properties: {
+      ...(schema.properties ?? {}),
+      via: {
+        type: "string",
+        enum: ["mcp", "http"],
+        description:
+          'Optional. How to pay: "mcp" (default, x402 over MCP) or "http" (plain HTTP 402 at the seller\'s /api/x402/query). Same rows, same price.',
+      },
+    },
+  }
+}
 
 const WHAT_WE_HAVE =
   "US (and some Canadian) organisation records, each with a street address: manufacturer dealer networks, retail " +
@@ -214,7 +317,7 @@ const TOOLS = [
       "Call find_location_lists, get_list_details and count_matching_records first (all free). Priced per row " +
       "requested (limit, default 20, max 100), a few cents for a normal query — usually less than the tokens " +
       "gathering it by hand would burn.",
-    inputSchema: SELLER.query_locations ?? FALLBACK_FILTERS,
+    inputSchema: withVia(SELLER.query_locations ?? FALLBACK_FILTERS),
   },
   {
     name: "check_wallet",
@@ -224,7 +327,59 @@ const TOOLS = [
   },
 ]
 
-const server = new Server({ name: "locationlists-x402-buyer", version: "1.0.0" }, { capabilities: { tools: {} } })
+/**
+ * Check limits, sign, pay, and report. `pay(payment)` performs the paid request
+ * on whichever transport and returns {ok, data, receipt, detail}.
+ */
+async function purchase(pr, pay) {
+  const terms = pr.accepts[0]
+  const priceUsd = Number(BigInt(terms.amount ?? terms.maxAmountRequired)) / 1e6
+  const text = (t) => ({ content: [{ type: "text", text: t }] })
+
+  // Refuse before signing, never after.
+  if (priceUsd > MAX_PER_CALL) {
+    return text(`Refused: $${priceUsd.toFixed(2)} exceeds the $${MAX_PER_CALL.toFixed(2)} per-call limit. Ask for fewer rows.`)
+  }
+  if (spentThisSession + priceUsd > MAX_TOTAL) {
+    return text(
+      `Refused: this would take the session to $${(spentThisSession + priceUsd).toFixed(2)}, over the ` +
+        `$${MAX_TOTAL.toFixed(2)} cap. Already spent $${spentThisSession.toFixed(2)}.`,
+    )
+  }
+  const balance = await usdcBalance(terms.asset)
+  if (balance < priceUsd) {
+    return text(`Refused: wallet holds $${balance.toFixed(2)} USDC, the query costs $${priceUsd.toFixed(2)}.`)
+  }
+
+  // Sign and pay.
+  const payment = await signPayment(pr, terms)
+  const r = await pay(payment)
+  if (!r.ok) {
+    return text(`Payment did not complete, and nothing was charged.\n${JSON.stringify(r.detail, null, 2)}`)
+  }
+
+  // The seller settles nothing when a query matched no rows, and then sends no
+  // receipt. Everything else counts against the cap, receipt or not — erring
+  // toward over-counting keeps the limit a limit.
+  const charged = !!r.receipt || r.data?.returned !== 0
+  if (charged) spentThisSession += priceUsd
+  return text(
+    JSON.stringify(
+      {
+        paid: charged ? `$${priceUsd.toFixed(2)} USDC on Base` : "$0.00 (nothing matched, nothing settled)",
+        paidTo: terms.payTo,
+        from: account.address,
+        ...(r.receipt?.transaction ? { transaction: r.receipt.transaction } : {}),
+        sessionSpend: `$${spentThisSession.toFixed(2)} of $${MAX_TOTAL.toFixed(2)}`,
+        ...r.data,
+      },
+      null,
+      2,
+    ),
+  )
+}
+
+const server = new Server({ name: "locationlists-x402-buyer", version: "1.2.0" }, { capabilities: { tools: {} } })
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
 
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
@@ -262,57 +417,49 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     if (name === "get_matching_records") {
-      const { dataset, ...filters } = args
+      const { dataset, via, ...filters } = args
       const call = { dataset, ...Object.fromEntries(Object.entries(filters).filter(([, v]) => v != null)) }
       if (!call.limit) call.limit = 20
 
-      // 1. Ask, unpaid, to learn the price.
+      if (via === "http") {
+        // Plain HTTP x402: 402 + PAYMENT-REQUIRED, pay with PAYMENT-SIGNATURE.
+        const quote = await httpQuery(call)
+        const pr = paymentRequiredOf(quote)
+        if (!pr) return text(JSON.stringify({ status: quote.status, response: quote.body }, null, 2))
+        return purchase(pr, async (payment) => {
+          const paid = await httpQuery(call, payment)
+          if (paid.status !== 200) return { ok: false, detail: { status: paid.status, response: paid.body } }
+          return { ok: true, data: paid.body, receipt: unb64(paid.headers.get("payment-response")) }
+        })
+      }
+
+      // 1. Ask, unpaid, to learn the price. MCP transport first; a seller that
+      //    answers with HTTP 402 instead is paid the HTTP way.
       const quote = await sellerCall("query_locations", call)
-      if (quote.status !== 402) {
+      const pr = paymentRequiredOf(quote)
+      if (!pr) {
         // Not a payment demand — the seller is telling us something else, such
-        // as "this dataset is too small to sell by the row, buy the file".
-        return text(JSON.stringify(quote.body, null, 2))
+        // as "this dataset is too small to sell by the row, buy the file", or
+        // that an argument is wrong. Nothing was charged.
+        const r = quote.body?.result
+        const msg = r?.content?.[0]?.text ?? JSON.stringify(quote.body, null, 2)
+        return { content: [{ type: "text", text: msg }], ...(r?.isError ? { isError: true } : {}) }
       }
-      const terms = quote.body.accepts[0]
-      const priceUsd = Number(BigInt(terms.amount ?? terms.maxAmountRequired)) / 1e6
+      const transport = quote.status === 402 ? "http" : "mcp"
 
-      // 2. Refuse before signing, never after.
-      if (priceUsd > MAX_PER_CALL) {
-        return text(`Refused: $${priceUsd.toFixed(2)} exceeds the $${MAX_PER_CALL.toFixed(2)} per-call limit. Ask for fewer rows.`)
-      }
-      if (spentThisSession + priceUsd > MAX_TOTAL) {
-        return text(
-          `Refused: this would take the session to $${(spentThisSession + priceUsd).toFixed(2)}, over the ` +
-            `$${MAX_TOTAL.toFixed(2)} cap. Already spent $${spentThisSession.toFixed(2)}.`,
-        )
-      }
-      const balance = await usdcBalance(terms.asset)
-      if (balance < priceUsd) {
-        return text(`Refused: wallet holds $${balance.toFixed(2)} USDC, the query costs $${priceUsd.toFixed(2)}.`)
-      }
-
-      // 3. Sign and pay.
-      const header = await signPayment(terms)
-      const paid = await sellerCall("query_locations", call, header)
-      if (paid.status !== 200 || paid.body?.result?.isError) {
-        return text(`Payment did not complete, and nothing was charged.\n${JSON.stringify(paid.body, null, 2)}`)
-      }
-
-      spentThisSession += priceUsd
-      const rows = JSON.parse(paid.body.result.content[0].text)
-      return text(
-        JSON.stringify(
-          {
-            paid: `$${priceUsd.toFixed(2)} USDC on Base`,
-            paidTo: terms.payTo,
-            from: account.address,
-            sessionSpend: `$${spentThisSession.toFixed(2)} of $${MAX_TOTAL.toFixed(2)}`,
-            ...rows,
-          },
-          null,
-          2,
-        ),
-      )
+      // 2-3. Limits, then sign and pay on the same transport the seller quoted on.
+      return purchase(pr, async (payment) => {
+        const paid = await sellerCall("query_locations", call, { payment, transport })
+        const r = paid.body?.result
+        if (paid.status !== 200 || !r || r.isError) {
+          return { ok: false, detail: r?.structuredContent ?? r?.content?.[0]?.text ?? paid.body }
+        }
+        const receipt =
+          r._meta?.["x402/payment-response"] ??
+          unb64(paid.headers.get("payment-response")) ??
+          unb64(paid.headers.get("x-payment-response"))
+        return { ok: true, data: JSON.parse(r.content[0].text), receipt }
+      })
     }
 
     return text(`Unknown tool: ${name}`)
