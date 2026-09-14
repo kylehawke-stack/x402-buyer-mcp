@@ -32,7 +32,9 @@ its list price and returns a permanent CSV download link. Datasets under 5,000 r
 are only sold that way.
 
 Paid tools are read from the seller at startup too: if locationlists.com adds a new
-paid tool, it appears here under its own name, spending from the per-row limits.
+paid tool, it appears here under its own name, spending from the per-row limits. Free
+seller tools pass straight through the same way — `request_a_new_list` when the list
+you need does not exist yet, `send_feedback`, `get_sample` — with no wallet involved.
 
 ## Install
 

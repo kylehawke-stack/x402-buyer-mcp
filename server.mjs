@@ -273,6 +273,26 @@ const KNOWN_PAID = {
 }
 const FREE_SELLER_TOOLS = new Set(["search_datasets", "get_dataset", "count_locations"])
 
+/**
+ * Every OTHER free seller tool is passed through as-is: schema and description
+ * from the seller, no wallet involved. A seller tool Claude cannot see is a tool
+ * the seller's own text will still tell it to call — request_list shipped on the
+ * seller, search results pointed at it, and Claude in Desktop drafted an email
+ * instead because this extension did not list it.
+ *
+ * Card-checkout tools are left out on purpose: this extension is the wallet
+ * path, and offering a Stripe link beside a funded wallet is a second way to pay
+ * for the same rows.
+ */
+const FREE_RENAMES = { request_list: "request_a_new_list" }
+const NOT_PASSED_THROUGH = new Set(["get_quote", "create_checkout", "check_order", "create_query_checkout"])
+const FREE_PASSTHROUGH = CATALOG.paid
+  ? Object.values(CATALOG.tools)
+      .filter((t) => !CATALOG.paid.includes(t.name) && !FREE_SELLER_TOOLS.has(t.name) && !NOT_PASSED_THROUGH.has(t.name))
+      .map((t) => ({ exposed: FREE_RENAMES[t.name] ?? t.name, seller: t.name, tool: t }))
+  : []
+const FREE_ROUTES = Object.fromEntries(FREE_PASSTHROUGH.map((f) => [f.exposed, f.seller]))
+
 /** The seller's query schema plus this extension's own `via` switch. */
 function withVia(schema) {
   return {
@@ -376,6 +396,12 @@ const TOOLS = [
         `($${MAX_TOTAL.toFixed(2)}) limits. ${CATALOG.tools[n].description ?? ""}`,
       inputSchema: CATALOG.tools[n].inputSchema ?? { type: "object", properties: {} },
     })),
+  // Free seller tools, verbatim (request_a_new_list, send_feedback, get_sample…).
+  ...FREE_PASSTHROUGH.map((f) => ({
+    name: f.exposed,
+    description: `Free. ${f.tool.description ?? ""}`,
+    inputSchema: f.tool.inputSchema ?? { type: "object", properties: {} },
+  })),
   {
     name: "check_wallet",
     description:
@@ -461,7 +487,7 @@ async function purchase(pr, pay, kind = "rows") {
   )
 }
 
-const server = new Server({ name: "locationlists-x402-buyer", version: "1.3.0" }, { capabilities: { tools: {} } })
+const server = new Server({ name: "locationlists-x402-buyer", version: "1.3.1" }, { capabilities: { tools: {} } })
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
 
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
@@ -493,8 +519,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     // Free pass-throughs: same arguments, seller's answer verbatim.
-    if (name === "get_list_details" || name === "count_matching_records") {
-      const { body } = await sellerCall(name === "get_list_details" ? "get_dataset" : "count_locations", args)
+    if (name === "get_list_details" || name === "count_matching_records" || FREE_ROUTES[name]) {
+      const seller = FREE_ROUTES[name] ?? (name === "get_list_details" ? "get_dataset" : "count_locations")
+      const { body } = await sellerCall(seller, args)
       const r = body?.result
       return { content: [{ type: "text", text: r?.content?.[0]?.text ?? JSON.stringify(body) }], ...(r?.isError ? { isError: true } : {}) }
     }
