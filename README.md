@@ -10,7 +10,13 @@ actually take.
 
 ## What happens
 
-You ask Claude a question it needs data to answer. Claude calls `buy_location_data`.
+You ask Claude a question it needs data to answer. Claude finds the right list with
+`find_location_lists`, reads its columns with `get_list_details`, sizes and prices the
+answer with `count_matching_records` (all free), then calls `get_matching_records`.
+Filters reach every column a list carries — revenue, employees, category, dealer tier —
+not just geography, and the filter arguments are read from locationlists.com at startup,
+so new ones arrive without reinstalling.
+
 The extension asks locationlists.com for the records, gets back **HTTP 402** with a
 price, signs a **USDC payment on Base**, retries with the payment attached, and hands
 Claude the rows. The whole thing takes a few seconds and settles on a public
@@ -62,7 +68,12 @@ the session spend, and the limits.
 > there so I know who I'm competing against.
 
 Claude will search the catalog, see the rows cost money, buy the ones it needs, and
-answer with real dealers — names, addresses, phone numbers. The tool response names
+answer with real dealers — names, addresses, phone numbers.
+
+> Which nonprofits in Richmond, Virginia have more than $2M in revenue?
+
+Claude counts first (249, plus 2,114 with no revenue on file), sees the three pages
+cost under a dollar, and buys them largest first. The tool response names
 the amount paid and both wallet addresses, so you can verify the transaction on
 [Basescan](https://basescan.org).
 

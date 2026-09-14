@@ -2,7 +2,7 @@
   "manifest_version": "0.2",
   "name": "locationlists-buyer",
   "display_name": "LocationLists \u2014 Agent Wallet",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Lets Claude buy business location data on its own, paying in USDC on Base. No card, no account, no checkout page.",
   "long_description": "Claude cannot sign an on-chain payment \u2014 it holds no keys, and it never will. This extension gives it a wallet to call.\n\nWhen Claude needs location data it does not have, it calls a tool here. The tool asks locationlists.com for the data, receives an HTTP 402 with a price, signs a USDC payment on Base, and returns the records. Claude decides what to buy; this extension holds the money.\n\nYou must fund the wallet yourself with USDC on Base. Spending limits are enforced before anything is signed: a per-call cap and a per-session cap, both of which you set below. An LLM with a wallet will eventually call a paid tool in a loop, so these are not optional.",
   "author": {
@@ -38,12 +38,20 @@
   },
   "tools": [
     {
-      "name": "find_dealer_and_store_lists",
-      "description": "Free. Ready-made lists of a brand's dealer/store locations \u2014 check before browsing its locator."
+      "name": "find_location_lists",
+      "description": "Free. Ready-made lists of dealers, stores, nonprofits, banks, contractors, clinicians and more \u2014 check before browsing a locator or registry."
     },
     {
-      "name": "get_dealer_and_store_locations",
-      "description": "Buy the rows, paying per row in USDC on Base."
+      "name": "get_list_details",
+      "description": "Free. A list's columns with fill rates and examples, record count and price."
+    },
+    {
+      "name": "count_matching_records",
+      "description": "Free. How many records match a filter on any column, and what fetching them costs."
+    },
+    {
+      "name": "get_matching_records",
+      "description": "Buy the matching records, filtered on any column, paying per row in USDC on Base."
     },
     {
       "name": "check_wallet",
