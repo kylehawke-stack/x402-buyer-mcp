@@ -44,6 +44,10 @@ const SELLER_MCP = process.env.X402_SELLER_MCP || "https://locationlists.com/mcp
 const RPC = process.env.X402_RPC_URL || "https://mainnet.base.org"
 const MAX_PER_CALL = Number(process.env.MAX_SPEND_PER_CALL_USD || "1.00")
 const MAX_TOTAL = Number(process.env.MAX_SPEND_TOTAL_USD || "5.00")
+// Whole-list purchases get their own budget. A $99 file can never fit a $1
+// per-call cap, and raising that cap to $100 would also let a looping agent buy
+// $100 of rows per call. One number bounds both a single file and a loop of them.
+const MAX_FILES_TOTAL = Number(process.env.MAX_SPEND_FILES_TOTAL_USD || "100.00")
 
 const key = process.env.X402_BUYER_KEY
 if (!key) {
@@ -58,6 +62,7 @@ const ERC20_BALANCE = [
 ]
 
 let spentThisSession = 0
+let spentOnFiles = 0
 
 /** The seller's plain-HTTP x402 endpoint, next to its MCP endpoint unless overridden. */
 const SELLER_HTTP = process.env.X402_SELLER_HTTP || new URL("/api/x402/query", SELLER_MCP).href
@@ -223,26 +228,50 @@ const FALLBACK_FILTERS = {
       description: "Conditions on any column, e.g. [{field:'revenue_amt', op:'gt', value:2000000}]",
       items: { type: "object", properties: { field: { type: "string" }, op: { type: "string" }, value: {} }, required: ["field", "op"] },
     },
-    limit: { type: "integer", minimum: 1, maximum: 100 },
+    limit: { type: "integer", minimum: 1, maximum: 1000 },
   },
   required: ["dataset"],
 }
 
-async function sellerSchemas() {
-  try {
-    const res = await fetch(SELLER_MCP, {
+/**
+ * The seller's tools (tools/list) and which of them cost money (the `payment`
+ * block of its GET descriptor). Paid tools are no longer a hand-kept list either:
+ * buy_dataset shipped on the seller a day after this extension and sat unusable
+ * here for a week, because nothing told the extension it existed.
+ */
+async function sellerCatalog() {
+  const opts = { signal: AbortSignal.timeout(8000) }
+  const [list, descriptor] = await Promise.all([
+    fetch(SELLER_MCP, {
+      ...opts,
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
-      signal: AbortSignal.timeout(8000),
     })
-    const tools = (await res.json())?.result?.tools ?? []
-    return Object.fromEntries(tools.map((t) => [t.name, t.inputSchema]))
-  } catch {
-    return {}
-  }
+      .then((r) => r.json())
+      .catch(() => null),
+    fetch(SELLER_MCP, { ...opts, headers: { Accept: "application/json" } })
+      .then((r) => r.json())
+      .catch(() => null),
+  ])
+  const tools = Object.fromEntries((list?.result?.tools ?? []).map((t) => [t.name, t]))
+  const paid = descriptor?.payment?.paidTools
+  return { tools, paid: Array.isArray(paid) ? paid : null }
 }
-const SELLER = await sellerSchemas()
+const CATALOG = await sellerCatalog()
+const SELLER = Object.fromEntries(Object.entries(CATALOG.tools).map(([n, t]) => [n, t.inputSchema]))
+
+/**
+ * Paid seller tools this extension knows how to present, and which budget each
+ * spends from. Any OTHER paid tool the seller advertises is exposed under its own
+ * name with the per-row limits — the conservative budget — so a new paid tool is
+ * usable the day it ships, without a release here.
+ */
+const KNOWN_PAID = {
+  query_locations: { name: "get_matching_records", kind: "rows" },
+  buy_dataset: { name: "buy_complete_list", kind: "file" },
+}
+const FREE_SELLER_TOOLS = new Set(["search_datasets", "get_dataset", "count_locations"])
 
 /** The seller's query schema plus this extension's own `via` switch. */
 function withVia(schema) {
@@ -317,10 +346,36 @@ const TOOLS = [
       "answer that, and each is a separate site with a separate format. These datasets share one schema.\n\n" +
       "Also refreshed on a schedule, so the same question next month does not mean redoing the work.\n\n" +
       "Call find_location_lists, get_list_details and count_matching_records first (all free). Priced per row " +
-      "requested (limit, default 20, max 100), a few cents for a normal query — usually less than the tokens " +
-      "gathering it by hand would burn.",
+      "requested (limit, default 20; the most per call is 100 to 1,000 depending on how wide the list's rows are — " +
+      "count_matching_records reports it as maxRowsPerCall), a few cents for a normal query — usually less than " +
+      "the tokens gathering it by hand would burn. When the user wants most or all of a list, use buy_complete_list.",
     inputSchema: withVia(SELLER.query_locations ?? FALLBACK_FILTERS),
   },
+  {
+    name: "buy_complete_list",
+    description:
+      "Buy an ENTIRE list outright: one USDC payment on Base at the same list price a person pays by card, and a " +
+      "permanent CSV download link. Use this instead of get_matching_records when the user wants most or all of a " +
+      "list — per-row queries deliberately cost more than the file once you pass about half its records " +
+      "(count_matching_records says which is cheaper). Whole-list purchases spend from their own session budget " +
+      `($${MAX_FILES_TOTAL.toFixed(2)}), separate from the small per-row limits. Tell the user the price ` +
+      "(get_list_details) and get a yes before calling.",
+    inputSchema: SELLER.buy_dataset ?? {
+      type: "object",
+      properties: { dataset: { type: "string", description: "Dataset slug from find_location_lists" } },
+      required: ["dataset"],
+    },
+  },
+  // Paid tools the seller advertises that this extension has no wrapper for.
+  ...(CATALOG.paid ?? [])
+    .filter((n) => !KNOWN_PAID[n] && !FREE_SELLER_TOOLS.has(n) && CATALOG.tools[n])
+    .map((n) => ({
+      name: n,
+      description:
+        `Paid, in USDC on Base, within this wallet's per-call ($${MAX_PER_CALL.toFixed(2)}) and session ` +
+        `($${MAX_TOTAL.toFixed(2)}) limits. ${CATALOG.tools[n].description ?? ""}`,
+      inputSchema: CATALOG.tools[n].inputSchema ?? { type: "object", properties: {} },
+    })),
   {
     name: "check_wallet",
     description:
@@ -329,24 +384,43 @@ const TOOLS = [
   },
 ]
 
+/** Exposed tool name → the seller's paid tool and the budget it spends from. */
+const PAID_ROUTES = Object.fromEntries([
+  ...Object.entries(KNOWN_PAID).map(([seller, { name, kind }]) => [name, { seller, kind }]),
+  ...TOOLS.filter((t) => CATALOG.tools[t.name] && (CATALOG.paid ?? []).includes(t.name) && !KNOWN_PAID[t.name]).map((t) => [
+    t.name,
+    { seller: t.name, kind: "rows" },
+  ]),
+])
+
 /**
  * Check limits, sign, pay, and report. `pay(payment)` performs the paid request
  * on whichever transport and returns {ok, data, receipt, detail}.
  */
-async function purchase(pr, pay) {
+async function purchase(pr, pay, kind = "rows") {
   const terms = pr.accepts[0]
   const priceUsd = Number(BigInt(terms.amount ?? terms.maxAmountRequired)) / 1e6
   const text = (t) => ({ content: [{ type: "text", text: t }] })
 
   // Refuse before signing, never after.
-  if (priceUsd > MAX_PER_CALL) {
-    return text(`Refused: $${priceUsd.toFixed(2)} exceeds the $${MAX_PER_CALL.toFixed(2)} per-call limit. Ask for fewer rows.`)
-  }
-  if (spentThisSession + priceUsd > MAX_TOTAL) {
-    return text(
-      `Refused: this would take the session to $${(spentThisSession + priceUsd).toFixed(2)}, over the ` +
-        `$${MAX_TOTAL.toFixed(2)} cap. Already spent $${spentThisSession.toFixed(2)}.`,
-    )
+  if (kind === "file") {
+    if (spentOnFiles + priceUsd > MAX_FILES_TOTAL) {
+      return text(
+        `Refused: this list costs $${priceUsd.toFixed(2)}, and whole-list purchases this session are capped at ` +
+          `$${MAX_FILES_TOTAL.toFixed(2)} (already spent $${spentOnFiles.toFixed(2)}). The user can raise ` +
+          `MAX_SPEND_FILES_TOTAL_USD ("Maximum on whole lists per session") and restart Claude.`,
+      )
+    }
+  } else {
+    if (priceUsd > MAX_PER_CALL) {
+      return text(`Refused: $${priceUsd.toFixed(2)} exceeds the $${MAX_PER_CALL.toFixed(2)} per-call limit. Ask for fewer rows.`)
+    }
+    if (spentThisSession + priceUsd > MAX_TOTAL) {
+      return text(
+        `Refused: this would take the session to $${(spentThisSession + priceUsd).toFixed(2)}, over the ` +
+          `$${MAX_TOTAL.toFixed(2)} cap. Already spent $${spentThisSession.toFixed(2)}.`,
+      )
+    }
   }
   const balance = await usdcBalance(terms.asset)
   if (balance < priceUsd) {
@@ -364,7 +438,10 @@ async function purchase(pr, pay) {
   // receipt. Everything else counts against the cap, receipt or not — erring
   // toward over-counting keeps the limit a limit.
   const charged = !!r.receipt || r.data?.returned !== 0
-  if (charged) spentThisSession += priceUsd
+  if (charged) {
+    if (kind === "file") spentOnFiles += priceUsd
+    else spentThisSession += priceUsd
+  }
   return text(
     JSON.stringify(
       {
@@ -372,7 +449,10 @@ async function purchase(pr, pay) {
         paidTo: terms.payTo,
         from: account.address,
         ...(r.receipt?.transaction ? { transaction: r.receipt.transaction } : {}),
-        sessionSpend: `$${spentThisSession.toFixed(2)} of $${MAX_TOTAL.toFixed(2)}`,
+        sessionSpend:
+          kind === "file"
+            ? `$${spentOnFiles.toFixed(2)} of $${MAX_FILES_TOTAL.toFixed(2)} on whole lists`
+            : `$${spentThisSession.toFixed(2)} of $${MAX_TOTAL.toFixed(2)}`,
         ...r.data,
       },
       null,
@@ -381,7 +461,7 @@ async function purchase(pr, pay) {
   )
 }
 
-const server = new Server({ name: "locationlists-x402-buyer", version: "1.2.0" }, { capabilities: { tools: {} } })
+const server = new Server({ name: "locationlists-x402-buyer", version: "1.3.0" }, { capabilities: { tools: {} } })
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
 
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
@@ -398,7 +478,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
             network: "Base",
             usdc: bal.toFixed(2),
             spentThisSession: spentThisSession.toFixed(2),
-            limits: { perCall: MAX_PER_CALL, sessionTotal: MAX_TOTAL },
+            spentOnWholeLists: spentOnFiles.toFixed(2),
+            limits: { perCall: MAX_PER_CALL, sessionTotal: MAX_TOTAL, wholeListsPerSession: MAX_FILES_TOTAL },
           },
           null,
           2,
@@ -418,12 +499,14 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       return { content: [{ type: "text", text: r?.content?.[0]?.text ?? JSON.stringify(body) }], ...(r?.isError ? { isError: true } : {}) }
     }
 
-    if (name === "get_matching_records") {
-      const { dataset, via, ...filters } = args
-      const call = { dataset, ...Object.fromEntries(Object.entries(filters).filter(([, v]) => v != null)) }
-      if (!call.limit) call.limit = 20
+    const route = PAID_ROUTES[name]
+    if (route) {
+      const { via, ...rest } = args
+      const call = Object.fromEntries(Object.entries(rest).filter(([, v]) => v != null))
+      if (route.seller === "query_locations" && !call.limit) call.limit = 20
 
-      if (via === "http") {
+      // The plain HTTP endpoint exists only for row queries.
+      if (via === "http" && route.seller === "query_locations") {
         // Plain HTTP x402: 402 + PAYMENT-REQUIRED, pay with PAYMENT-SIGNATURE.
         const quote = await httpQuery(call)
         const pr = paymentRequiredOf(quote)
@@ -437,7 +520,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 
       // 1. Ask, unpaid, to learn the price. MCP transport first; a seller that
       //    answers with HTTP 402 instead is paid the HTTP way.
-      const quote = await sellerCall("query_locations", call)
+      const quote = await sellerCall(route.seller, call)
       const pr = paymentRequiredOf(quote)
       if (!pr) {
         // Not a payment demand — the seller is telling us something else, such
@@ -450,18 +533,28 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const transport = quote.status === 402 ? "http" : "mcp"
 
       // 2-3. Limits, then sign and pay on the same transport the seller quoted on.
-      return purchase(pr, async (payment) => {
-        const paid = await sellerCall("query_locations", call, { payment, transport })
-        const r = paid.body?.result
-        if (paid.status !== 200 || !r || r.isError) {
-          return { ok: false, detail: r?.structuredContent ?? r?.content?.[0]?.text ?? paid.body }
-        }
-        const receipt =
-          r._meta?.["x402/payment-response"] ??
-          unb64(paid.headers.get("payment-response")) ??
-          unb64(paid.headers.get("x-payment-response"))
-        return { ok: true, data: JSON.parse(r.content[0].text), receipt }
-      })
+      return purchase(
+        pr,
+        async (payment) => {
+          const paid = await sellerCall(route.seller, call, { payment, transport })
+          const r = paid.body?.result
+          if (paid.status !== 200 || !r || r.isError) {
+            return { ok: false, detail: r?.structuredContent ?? r?.content?.[0]?.text ?? paid.body }
+          }
+          const receipt =
+            r._meta?.["x402/payment-response"] ??
+            unb64(paid.headers.get("payment-response")) ??
+            unb64(paid.headers.get("x-payment-response"))
+          let data
+          try {
+            data = JSON.parse(r.content[0].text)
+          } catch {
+            data = { result: r.content?.[0]?.text }
+          }
+          return { ok: true, data, receipt }
+        },
+        route.kind,
+      )
     }
 
     return text(`Unknown tool: ${name}`)
